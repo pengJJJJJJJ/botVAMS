@@ -1759,7 +1759,6 @@ config VIDEO_OV9650
 config VIDEO_OV9734
 	tristate "OmniVision OV9734 sensor support"
 	depends on VIDEO_DEV && I2C
-	depends on ACPI || COMPILE_TEST
 	select MEDIA_CONTROLLER
 	select VIDEO_V4L2_SUBDEV_API
 	select V4L2_FWNODE
