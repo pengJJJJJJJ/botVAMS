@@ -27,8 +27,11 @@
 // Note: EDP and MIPI are mutually exclusive as they share VOP. Modify yourself if simultaneous display needed
 // #include "tspi-rk3566-dsi-v10.dtsi"
 
+//【开/关】3.5寸mipi屏幕配置，面板：L035CN195 芯片：FL7703N
+#include "tspi-rk3566-dsi-L035CN195.dtsi"
+
 //[ON/OFF] HDMI display screen config, rarely needs modification, comment out if HDMI not needed
-#include "tspi-rk3566-hdmi-v10.dtsi"
+// #include "tspi-rk3566-hdmi-v10.dtsi"
 
 //[ON/OFF] Camera, currently using ov5695
 #include "tspi-rk3566-csi-v10.dtsi"
