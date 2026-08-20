@@ -1,0 +1,117 @@
+/********************************************************************
+ * SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+ *
+ * Copyright (c) 2023 Rockchip Electronics Co., Ltd.
+ * Copyright (c) 2026 LCKFB <lckfb@sz-jlc.com>
+ *********************************************************************
+ * Wiki-(Chinese)：https://wiki.lckfb.com/
+ * Wiki-(English)：https://wiki.lckfb.com/en/
+ *********************************************************************/
+
+// OV9734 sensor config (1-lane MIPI, 1296x734@30fps)
+// 独立 dtsi：包含 CSI D-PHY / ISP / i2c 全部基础配置，不再依赖 csi-v10.dtsi
+
+//phy u sequence
+&combphy1_usq {
+	status = "okay";
+};
+
+//phy P sequence
+&combphy2_psq {
+	status = "okay";
+};
+
+//dphy hardware
+&csi2_dphy_hw {
+	status = "okay";
+};
+
+//Camera D-PHY interface (ov9734 -> dphy1, 1-lane)
+&csi2_dphy1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			dphy1_in: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&ov9734_out>;
+				data-lanes = <1>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			dphy1_out: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&isp0_in>;
+			};
+		};
+	};
+};
+
+//Hardware image processor module
+&rkisp {
+	status = "okay";
+};
+
+//Hardware image processor module memory manager
+&rkisp_mmu {
+	status = "okay";
+};
+
+//Image processing interface
+&rkisp_vir0 {
+	status = "okay";
+
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		isp0_in: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&dphy1_out>;
+		};
+	};
+};
+
+//Camera sensor I2C bus
+&i2c4 {
+	/* i2c4 sda conflict with camera pwdn */
+	status = "okay";
+
+	ov9734: ov9734@36 {
+		status = "okay";
+		compatible = "ovti,ov9734";
+		reg = <0x36>;
+		clocks = <&cru CLK_CIF_OUT>;
+		clock-names = "xvclk";
+		clock-frequency = <19200000>;
+		power-domains = <&power RK3568_PD_VI>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cif_clk>;
+		reset-gpios = <&gpio4 RK_PB5 GPIO_ACTIVE_LOW>;
+		pwdn-gpios = <&gpio4 RK_PB4 GPIO_ACTIVE_HIGH>;
+		power-gpios = <&gpio0 RK_PB0 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "NC";
+		rockchip,camera-module-lens-name = "NC";
+		port {
+			ov9734_out: endpoint {
+				remote-endpoint = <&dphy1_in>;
+				data-lanes = <1>;
+				link-frequencies = /bits/ 64 <180000000>;
+			};
+		};
+	};
+};
