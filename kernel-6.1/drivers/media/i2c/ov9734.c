@@ -3,10 +3,16 @@
 
 #include <asm/unaligned.h>
 #include <linux/acpi.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/compat.h>
+#include <linux/of.h>
+#include <linux/rk-camera-module.h>
+#include <linux/slab.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
@@ -14,9 +20,12 @@
 #define OV9734_LINK_FREQ_180MHZ		180000000ULL
 #define OV9734_SCLK			36000000LL
 #define OV9734_MCLK			19200000
+#define OV9734_XVCLK_FREQ		19200000
 /* ov9734 only support 1-lane mipi output */
 #define OV9734_DATA_LANES		1
 #define OV9734_RGB_DEPTH		10
+
+#define OV9734_NAME			"ov9734"
 
 #define OV9734_REG_CHIP_ID		0x300a
 #define OV9734_CHIP_ID			0x9734
@@ -340,6 +349,18 @@ struct ov9734 {
 
 	/* Streaming on/off */
 	bool streaming;
+
+	/* GPIOs and clock */
+	struct clk *xvclk;
+	struct gpio_desc *reset_gpio;
+	struct gpio_desc *pwdn_gpio;
+	struct gpio_desc *power_gpio;
+
+	/* Camera module information from DT */
+	u32 module_index;
+	const char *module_facing;
+	const char *module_name;
+	const char *len_name;
 };
 
 static inline struct ov9734 *to_ov9734(struct v4l2_subdev *subdev)
@@ -832,14 +853,91 @@ static const struct v4l2_subdev_video_ops ov9734_video_ops = {
 	.s_stream = ov9734_set_stream,
 };
 
+static int ov9734_get_mbus_config(struct v4l2_subdev *sd,
+				  unsigned int pad_id,
+				  struct v4l2_mbus_config *config)
+{
+	config->type = V4L2_MBUS_CSI2_DPHY;
+	config->bus.mipi_csi2.num_data_lanes = OV9734_DATA_LANES;
+
+	return 0;
+}
+
 static const struct v4l2_subdev_pad_ops ov9734_pad_ops = {
 	.set_fmt = ov9734_set_format,
 	.get_fmt = ov9734_get_format,
 	.enum_mbus_code = ov9734_enum_mbus_code,
 	.enum_frame_size = ov9734_enum_frame_size,
+	.get_mbus_config = ov9734_get_mbus_config,
+};
+
+static void ov9734_get_module_inf(struct ov9734 *ov9734,
+				  struct rkmodule_inf *inf)
+{
+	memset(inf, 0, sizeof(*inf));
+	strscpy(inf->base.sensor, OV9734_NAME, sizeof(inf->base.sensor));
+	strscpy(inf->base.module, ov9734->module_name,
+		sizeof(inf->base.module));
+	strscpy(inf->base.lens, ov9734->len_name, sizeof(inf->base.lens));
+}
+
+static long ov9734_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+{
+	struct ov9734 *ov9734 = to_ov9734(sd);
+	long ret = 0;
+
+	switch (cmd) {
+	case RKMODULE_GET_MODULE_INFO:
+		ov9734_get_module_inf(ov9734, (struct rkmodule_inf *)arg);
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
+		break;
+	}
+
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+static long ov9734_compat_ioctl32(struct v4l2_subdev *sd,
+				  unsigned int cmd, unsigned long arg)
+{
+	void __user *up = compat_ptr(arg);
+	struct rkmodule_inf *inf;
+	long ret = 0;
+
+	switch (cmd) {
+	case RKMODULE_GET_MODULE_INFO:
+		inf = kzalloc(sizeof(*inf), GFP_KERNEL);
+		if (!inf)
+			return -ENOMEM;
+
+		ret = ov9734_ioctl(sd, cmd, inf);
+		if (!ret) {
+			ret = copy_to_user(up, inf, sizeof(*inf));
+			if (ret)
+				ret = -EFAULT;
+		}
+		kfree(inf);
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
+		break;
+	}
+
+	return ret;
+}
+#endif
+
+static const struct v4l2_subdev_core_ops ov9734_core_ops = {
+	.ioctl = ov9734_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl32 = ov9734_compat_ioctl32,
+#endif
 };
 
 static const struct v4l2_subdev_ops ov9734_subdev_ops = {
+	.core = &ov9734_core_ops,
 	.video = &ov9734_video_ops,
 	.pad = &ov9734_pad_ops,
 };
@@ -930,6 +1028,64 @@ check_hwcfg_error:
 	return ret;
 }
 
+static int ov9734_power_on(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov9734 *ov9734 = to_ov9734(sd);
+	int ret;
+
+	ret = clk_set_rate(ov9734->xvclk, OV9734_XVCLK_FREQ);
+	if (ret < 0) {
+		dev_err(dev, "failed to set xvclk rate (%d Hz)\n",
+			OV9734_XVCLK_FREQ);
+		return ret;
+	}
+	if (clk_get_rate(ov9734->xvclk) != OV9734_XVCLK_FREQ)
+		dev_warn(dev, "xvclk mismatched, modes are based on %d Hz\n",
+			 OV9734_XVCLK_FREQ);
+
+	ret = clk_prepare_enable(ov9734->xvclk);
+	if (ret < 0) {
+		dev_err(dev, "failed to enable xvclk\n");
+		return ret;
+	}
+
+	gpiod_set_value_cansleep(ov9734->reset_gpio, 1);
+	if (ov9734->power_gpio)
+		gpiod_set_value_cansleep(ov9734->power_gpio, 1);
+	usleep_range(1000, 2000);
+
+	gpiod_set_value_cansleep(ov9734->reset_gpio, 0);
+	gpiod_set_value_cansleep(ov9734->pwdn_gpio, 1);
+	usleep_range(10000, 20000);
+
+	return 0;
+}
+
+static int ov9734_power_off(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov9734 *ov9734 = to_ov9734(sd);
+
+	gpiod_set_value_cansleep(ov9734->pwdn_gpio, 0);
+	clk_disable_unprepare(ov9734->xvclk);
+	gpiod_set_value_cansleep(ov9734->reset_gpio, 1);
+	if (ov9734->power_gpio)
+		gpiod_set_value_cansleep(ov9734->power_gpio, 0);
+
+	return 0;
+}
+
+static int __maybe_unused ov9734_runtime_resume(struct device *dev)
+{
+	return ov9734_power_on(dev);
+}
+
+static int __maybe_unused ov9734_runtime_suspend(struct device *dev)
+{
+	return ov9734_power_off(dev);
+}
+
 static void ov9734_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
@@ -939,6 +1095,8 @@ static void ov9734_remove(struct i2c_client *client)
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
 	pm_runtime_disable(&client->dev);
+	if (!pm_runtime_status_suspended(&client->dev))
+		ov9734_power_off(&client->dev);
 	pm_runtime_set_suspended(&client->dev);
 	mutex_destroy(&ov9734->mutex);
 }
@@ -959,15 +1117,53 @@ static int ov9734_probe(struct i2c_client *client)
 	if (!ov9734)
 		return -ENOMEM;
 
-	v4l2_i2c_subdev_init(&ov9734->sd, client, &ov9734_subdev_ops);
-	ret = ov9734_identify_module(ov9734);
+	ret = of_property_read_u32(client->dev.of_node,
+				   RKMODULE_CAMERA_MODULE_INDEX,
+				   &ov9734->module_index);
+	ret |= of_property_read_string(client->dev.of_node,
+				       RKMODULE_CAMERA_MODULE_FACING,
+				       &ov9734->module_facing);
+	ret |= of_property_read_string(client->dev.of_node,
+				       RKMODULE_CAMERA_MODULE_NAME,
+				       &ov9734->module_name);
+	ret |= of_property_read_string(client->dev.of_node,
+				       RKMODULE_CAMERA_LENS_NAME,
+				       &ov9734->len_name);
 	if (ret) {
-		dev_err(&client->dev, "failed to find sensor: %d", ret);
-		return ret;
+		dev_err(&client->dev, "could not get module information!\n");
+		return -EINVAL;
+	}
+
+	ov9734->xvclk = devm_clk_get(&client->dev, "xvclk");
+	if (IS_ERR(ov9734->xvclk)) {
+		dev_err(&client->dev, "failed to get xvclk clock\n");
+		return PTR_ERR(ov9734->xvclk);
+	}
+
+	ov9734->reset_gpio = devm_gpiod_get(&client->dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(ov9734->reset_gpio)) {
+		dev_err(&client->dev, "failed to get reset-gpios\n");
+		return PTR_ERR(ov9734->reset_gpio);
+	}
+
+	ov9734->pwdn_gpio = devm_gpiod_get(&client->dev, "pwdn", GPIOD_OUT_LOW);
+	if (IS_ERR(ov9734->pwdn_gpio)) {
+		dev_err(&client->dev, "failed to get pwdn-gpios\n");
+		return PTR_ERR(ov9734->pwdn_gpio);
+	}
+
+	ov9734->power_gpio = devm_gpiod_get_optional(&client->dev, "power",
+						     GPIOD_OUT_LOW);
+	if (IS_ERR(ov9734->power_gpio)) {
+		dev_err(&client->dev, "failed to get power-gpios\n");
+		return PTR_ERR(ov9734->power_gpio);
 	}
 
 	mutex_init(&ov9734->mutex);
 	ov9734->cur_mode = &supported_modes[0];
+
+	v4l2_i2c_subdev_init(&ov9734->sd, client, &ov9734_subdev_ops);
+
 	ret = ov9734_init_controls(ov9734);
 	if (ret) {
 		dev_err(&client->dev, "failed to init controls: %d", ret);
@@ -985,13 +1181,32 @@ static int ov9734_probe(struct i2c_client *client)
 		goto probe_error_v4l2_ctrl_handler_free;
 	}
 
-	/*
-	 * Device is already turned on by i2c-core with ACPI domain PM.
-	 * Enable runtime PM and turn off the device.
-	 */
+	ret = ov9734_power_on(&client->dev);
+	if (ret) {
+		dev_err(&client->dev, "failed to power on sensor: %d", ret);
+		goto probe_error_media_entity_cleanup;
+	}
+
+	ret = ov9734_identify_module(ov9734);
+	if (ret) {
+		dev_err(&client->dev, "failed to find sensor: %d", ret);
+		goto probe_error_power_off;
+	}
+
 	pm_runtime_set_active(&client->dev);
 	pm_runtime_enable(&client->dev);
 	pm_runtime_idle(&client->dev);
+
+	{
+		char facing[2] = "f";
+
+		if (strcmp(ov9734->module_facing, "back") == 0)
+			facing[0] = 'b';
+
+		snprintf(ov9734->sd.name, sizeof(ov9734->sd.name),
+			 "m%02d_%s_%s %s", ov9734->module_index, facing,
+			 OV9734_NAME, dev_name(&client->dev));
+	}
 
 	ret = v4l2_async_register_subdev_sensor(&ov9734->sd);
 	if (ret < 0) {
@@ -1006,7 +1221,15 @@ probe_error_media_entity_cleanup_pm:
 	pm_runtime_disable(&client->dev);
 	pm_runtime_set_suspended(&client->dev);
 	media_entity_cleanup(&ov9734->sd.entity);
+	v4l2_ctrl_handler_free(ov9734->sd.ctrl_handler);
+	mutex_destroy(&ov9734->mutex);
 
+	return ret;
+
+probe_error_power_off:
+	ov9734_power_off(&client->dev);
+probe_error_media_entity_cleanup:
+	media_entity_cleanup(&ov9734->sd.entity);
 probe_error_v4l2_ctrl_handler_free:
 	v4l2_ctrl_handler_free(ov9734->sd.ctrl_handler);
 	mutex_destroy(&ov9734->mutex);
@@ -1016,6 +1239,7 @@ probe_error_v4l2_ctrl_handler_free:
 
 static const struct dev_pm_ops ov9734_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(ov9734_suspend, ov9734_resume)
+	SET_RUNTIME_PM_OPS(ov9734_runtime_suspend, ov9734_runtime_resume, NULL)
 };
 
 static const struct acpi_device_id ov9734_acpi_ids[] = {
@@ -1025,14 +1249,27 @@ static const struct acpi_device_id ov9734_acpi_ids[] = {
 
 MODULE_DEVICE_TABLE(acpi, ov9734_acpi_ids);
 
+static const struct of_device_id ov9734_of_match[] = {
+	{ .compatible = "ovti,ov9734" },
+	{}
+};
+MODULE_DEVICE_TABLE(of, ov9734_of_match);
+
+static const struct i2c_device_id ov9734_match_id[] = {
+	{ "ovti,ov9734", 0 },
+	{ }
+};
+
 static struct i2c_driver ov9734_i2c_driver = {
 	.driver = {
 		.name = "ov9734",
 		.pm = &ov9734_pm_ops,
 		.acpi_match_table = ov9734_acpi_ids,
+		.of_match_table = ov9734_of_match,
 	},
 	.probe_new = ov9734_probe,
 	.remove = ov9734_remove,
+	.id_table = ov9734_match_id,
 };
 
 module_i2c_driver(ov9734_i2c_driver);
